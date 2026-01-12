@@ -1,78 +1,153 @@
+# globalAccumulator.py
 """
-Global segment accumulator for immutable transcript history.
+Global transcript accumulator using word-level storage.
 
-This is Layer 3 of the streaming ASR architecture:
-- Layer 1: StreamingASR (2s rolling buffer, produces hypotheses)
-- Layer 2: SegmentManager (finds stable prefixes within segments)
-- Layer 3: GlobalAccumulator (append-only history, never changes)
+This is the append-only immutable history layer.
 
-Key invariant: Once text enters the accumulator, it NEVER changes.
+Key invariants:
+- Only accepts WordInfo objects (not strings)
+- Append-only (never modifies existing words)
+- Can render text on demand, but words are the source of truth
 """
 
-import time
+from typing import TypedDict
+
+
+class WordInfo(TypedDict):
+    """A single word with timing and confidence."""
+    word: str
+    start_ms: int
+    end_ms: int
+    probability: float
+
+
+class SegmentInfo(TypedDict):
+    """A finalized segment."""
+    segment_id: str
+    segment_index: int
+    words: list[WordInfo]
+    text: str
+    start_ms: int
+    end_ms: int
 
 
 class GlobalAccumulator:
     """
-    Maintains append-only history of finalized segments.
-
-    This is the "source of truth" for the transcript.
-    Rolling buffer resets don't affect this - only silence detection does.
+    Accumulates finalized words across segments.
+    
+    This is the single source of truth for the transcript.
+    Words are stored directly - no string diffing needed.
     """
 
     def __init__(self):
-        """Initialize empty accumulator."""
-        self.segments = []
-        self.counter = 0  # Monotonic segment index for stable ordering
+        # All finalized words in order
+        self.words: list[WordInfo] = []
+        
+        # Segment boundaries for export
+        self.segments: list[SegmentInfo] = []
+        
+        # Track current segment being accumulated
+        self._current_segment_id: str | None = None
+        self._current_segment_words: list[WordInfo] = []
+        self._segment_count = 0
 
-    def append(self, segment_id: str | None, text: str) -> dict:
+    def append_words(self, segment_id: str, words: list[WordInfo]) -> None:
         """
-        Append a finalized segment to immutable history.
-
+        Append finalized words to the accumulator.
+        
+        This is the ONLY way to add content. No diffing, no guessing.
+        
         Args:
-            segment_id: Unique segment identifier (auto-generated if None)
-            text: Finalized text (committed only, no partial)
-
-        Returns:
-            Finalized segment dict
+            segment_id: The segment these words belong to
+            words: List of WordInfo to append
         """
-        if not text:
-            return None
+        if not words:
+            return
+        
+        # Handle segment transition
+        if segment_id != self._current_segment_id:
+            # Finalize previous segment if exists
+            if self._current_segment_id is not None and self._current_segment_words:
+                self._finalize_current_segment()
+            
+            # Start new segment
+            self._current_segment_id = segment_id
+            self._current_segment_words = []
+        
+        # Append words
+        for word in words:
+            self.words.append(word)
+            self._current_segment_words.append(word)
+        
+        # Log
+        text = " ".join(w["word"] for w in words)
+        print(f"📝 Accumulated: \"{text}\" (total: {len(self.words)} words)")
 
-        # Guard: auto-generate segment_id if None
-        if segment_id is None:
-            segment_id = f"seg-auto-{int(time.time() * 1000)}"
-
-        finalized = {
-            "segment_index": self.counter,  # Monotonic index for stable ordering
-            "segment_id": segment_id,
-            "text": text,
-            "timestamp_ms": int(time.time() * 1000),
-            "final": True,
+    def _finalize_current_segment(self) -> None:
+        """Finalize the current segment and add to segments list."""
+        if not self._current_segment_words:
+            return
+        
+        segment: SegmentInfo = {
+            "segment_id": self._current_segment_id or "unknown",
+            "segment_index": self._segment_count,
+            "words": list(self._current_segment_words),
+            "text": " ".join(w["word"] for w in self._current_segment_words),
+            "start_ms": self._current_segment_words[0]["start_ms"],
+            "end_ms": self._current_segment_words[-1]["end_ms"],
         }
+        
+        self.segments.append(segment)
+        self._segment_count += 1
+        
+        print(f"📦 Segment {segment['segment_index']} finalized: \"{segment['text']}\"")
 
-        self.segments.append(finalized)
-        self.counter += 1
-        return finalized
+    def finalize(self) -> None:
+        """Finalize any remaining segment (call on stream end)."""
+        if self._current_segment_words:
+            self._finalize_current_segment()
+            self._current_segment_id = None
+            self._current_segment_words = []
 
     def get_full_transcript(self) -> str:
-        """
-        Get complete transcript from all finalized segments.
+        """Render the full transcript as a string."""
+        return " ".join(w["word"] for w in self.words)
 
-        Returns:
-            Full transcript text
-        """
-        return " ".join(seg["text"] for seg in self.segments)
+    def get_all_words(self) -> list[WordInfo]:
+        """Get all accumulated words."""
+        return list(self.words)
 
-    def get_segments(self) -> list[dict]:
+    def get_segments(self) -> list[SegmentInfo]:
         """
         Get all finalized segments.
-
-        Returns:
-            List of finalized segment dicts
+        
+        Note: Current in-progress segment is NOT included.
+        Call finalize() first if you need everything.
         """
-        return self.segments.copy()
+        # Include current segment if it has words
+        segments = list(self.segments)
+        
+        if self._current_segment_words:
+            current: SegmentInfo = {
+                "segment_id": self._current_segment_id or "unknown",
+                "segment_index": self._segment_count,
+                "words": list(self._current_segment_words),
+                "text": " ".join(w["word"] for w in self._current_segment_words),
+                "start_ms": self._current_segment_words[0]["start_ms"],
+                "end_ms": self._current_segment_words[-1]["end_ms"],
+            }
+            segments.append(current)
+        
+        return segments
 
-    def clear(self):
-        """Clear all accumulated segments."""
+    def get_word_count(self) -> int:
+        """Get total word count."""
+        return len(self.words)
+
+    def clear(self) -> None:
+        """Clear all accumulated data (for testing)."""
+        self.words = []
         self.segments = []
+        self._current_segment_id = None
+        self._current_segment_words = []
+        self._segment_count = 0

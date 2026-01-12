@@ -5,26 +5,75 @@ Segment stability management using word-level timestamps.
 Key insight: Track ALL word candidates for each audio region,
 then pick the BEST one (highest probability) when locking.
 
-Strategy:
-1. Group words by overlapping time regions
-2. Use word-length-based overlap threshold (short words = lower threshold)
-3. For each region, track all candidate transcriptions
-4. When region exits buffer, lock the highest-probability version
-5. Use locked words + current hypothesis for merged output
+Output Schema (the critical contract):
+- finalized_words: Words that JUST became final this revision (append these!)
+- stable_words: ALL finalized words so far in this segment
+- unstable_words: Best guesses for words still in buffer (may change!)
+- rendered_text: Convenience strings for display (NOT authoritative)
+
+Invariants:
+- Only SegmentManager decides when a word is final
+- Final words are append-only (never change)
+- Downstream code must NOT do string diffing
 """
+
+from typing import TypedDict
+
+
+class WordInfo(TypedDict):
+    """A single word with timing and confidence."""
+    word: str
+    start_ms: int
+    end_ms: int
+    probability: float
+
+
+class RenderedText(TypedDict):
+    """Convenience rendering for display (NOT authoritative)."""
+    stable: str      # Finalized text (won't change)
+    unstable: str    # Preview text (may change)
+    full: str        # stable + unstable
+
+
+class SegmentOutput(TypedDict):
+    """The output contract of SegmentManager.ingest()"""
+    segment_id: str
+    
+    # 🔒 Words that JUST became final (this revision only)
+    # Backend should APPEND these to permanent storage
+    finalized_words: list[WordInfo]
+    
+    # 🧱 All finalized words so far in this segment
+    stable_words: list[WordInfo]
+    
+    # 🌊 Best current hypothesis for words still in buffer
+    # These are UNSTABLE and may change or disappear
+    unstable_words: list[WordInfo]
+    
+    # 👁️ Convenience rendering (NOT authoritative - for display only)
+    rendered_text: RenderedText
+    
+    revision: int
+    final: bool
 
 
 class SegmentManager:
     """
     Manages segment stability using word-level timestamps.
 
-    Instead of just keeping the latest word, we:
-    - Track all word candidates for each audio region
-    - Pick the best (highest probability) when locking
-    - This prevents low-probability errors from being locked
+    Core responsibilities:
+    1. Group words by overlapping time regions
+    2. Track all candidate transcriptions per region
+    3. Select best candidate (highest probability) when locking
+    4. Expose structured output with clear stability boundaries
+    
+    Downstream code should:
+    - ONLY append finalized_words to permanent storage
+    - ONLY use rendered_text for display
+    - NEVER diff strings to determine what changed
     """
 
-    def __init__(self, lock_margin_ms=100):
+    def __init__(self, lock_margin_ms: int = 100):
         """
         Initialize segment manager.
         
@@ -34,83 +83,185 @@ class SegmentManager:
         self.lock_margin_ms = lock_margin_ms
         
         # Word candidates grouped by audio region
-        self.word_regions = []  # List of {"start_ms", "end_ms", "candidates": [...]}
+        # Each region: {"start_ms", "end_ms", "candidates": [...]}
+        self.word_regions: list[dict] = []
         
         # Words that have been locked (exited buffer, best candidate selected)
-        self.locked_words = []
+        self.locked_words: list[WordInfo] = []
+        
+        # Track segment ID for consistent identification
+        self.segment_id: str | None = None
 
-    def ingest(self, hypothesis: dict) -> dict:
+    def ingest(self, hypothesis: dict) -> SegmentOutput:
         """
-        Process hypothesis, track word candidates, and merge.
+        Process hypothesis, track word candidates, and emit structural stability updates.
 
         Args:
-            hypothesis: Hypothesis dict from StreamingASR
+            hypothesis: Hypothesis dict from StreamingASR containing:
+                - segment_id: str
+                - text: str (fallback when no word timestamps)
+                - words: list of word dicts with timing
+                - start_time_ms: buffer start
+                - end_time_ms: buffer end
+                - revision: int
 
         Returns:
-            Segment dict with committed text
+            SegmentOutput with clear stability boundaries
         """
-        text = hypothesis["text"]
+        revision = hypothesis.get("revision", 0)
+        segment_id = hypothesis.get("segment_id", "unknown")
         new_words = hypothesis.get("words", [])
         buffer_start_ms = hypothesis.get("start_time_ms", 0)
         buffer_end_ms = hypothesis.get("end_time_ms", buffer_start_ms + 2000)
-        revision = hypothesis.get("revision", 0)
-        
+
+        # Track segment ID on first ingest
+        if self.segment_id is None:
+            self.segment_id = segment_id
+
+        # === STEP 0: No word-level info → fallback rendering only ===
+        # Guard: Only use fallback if we haven't accumulated any words yet
         if not new_words:
+            # If we already have locked words, don't regress - just return current state
+            if self.locked_words or self.word_regions:
+                stable_text = " ".join(w["word"] for w in self.locked_words)
+                unstable_words = self._get_best_in_buffer_words()
+                unstable_text = " ".join(w["word"] for w in unstable_words)
+                return {
+                    "segment_id": self.segment_id or segment_id,
+                    "finalized_words": [],
+                    "stable_words": list(self.locked_words),
+                    "unstable_words": unstable_words,
+                    "rendered_text": {
+                        "stable": stable_text,
+                        "unstable": unstable_text,
+                        "full": " ".join(p for p in [stable_text, unstable_text] if p),
+                    },
+                    "revision": revision,
+                    "final": False,
+                }
+            
+            # True fallback: no words ever existed
             return {
-                "segment_id": hypothesis["segment_id"],
-                "committed": text,
-                "partial": "",
+                "segment_id": self.segment_id or segment_id,
+                "finalized_words": [],
+                "stable_words": [],
+                "unstable_words": [],
+                "rendered_text": {
+                    "stable": "",
+                    "unstable": hypothesis.get("text", ""),
+                    "full": hypothesis.get("text", ""),
+                },
                 "revision": revision,
                 "final": False,
             }
-        
-        # === STEP 0: Filter out invalid words (zero duration, punctuation only) ===
+
+        # === STEP 1: Filter invalid words ===
         valid_words = self._filter_valid_words(new_words)
-        
-        # === STEP 1: Add new words to candidate regions ===
+
+        # === STEP 2: Add word candidates ===
         for word in valid_words:
             self._add_word_candidate(word, revision)
-        
-        # === STEP 2: Lock regions that have exited the buffer ===
+
+        # === STEP 3: Lock regions that exited the buffer ===
         newly_locked = self._lock_exited_regions(buffer_start_ms)
-        
-        # === STEP 3: Get current best words for regions still in buffer ===
-        in_buffer_words = self._get_best_in_buffer_words(buffer_start_ms)
-        
-        # === STEP 4: Merge locked + in-buffer words ===
-        all_words = self.locked_words + in_buffer_words
-        all_words.sort(key=lambda w: w["start_ms"])
-        
-        merged_text = " ".join(w["word"] for w in all_words)
-        
+
+        # === STEP 4: Get best candidates still in buffer ===
+        unstable_words = self._get_best_in_buffer_words()
+
+        # === STEP 5: Stable words = locked_words ===
+        stable_words = list(self.locked_words)
+
+        # === STEP 6: Build rendered views (NON-authoritative) ===
+        stable_text = " ".join(w["word"] for w in stable_words)
+        unstable_text = " ".join(w["word"] for w in unstable_words)
+        full_text = " ".join(
+            part for part in [stable_text, unstable_text] if part
+        )
+
         # === LOGGING ===
-        print(f"📊 Merge Result (revision {revision}):")
-        print(f"   Buffer window: [{buffer_start_ms} - {buffer_end_ms}ms]")
-        print(f"   New hypothesis: \"{text}\"")
-        
+        print(f"📊 Revision {revision}")
+        print(f"   Buffer: [{buffer_start_ms}–{buffer_end_ms}ms]")
         if newly_locked:
-            locked_text = " ".join(w["word"] for w in newly_locked)
-            print(f"   🔒 NEWLY LOCKED: \"{locked_text}\"")
-        
-        if self.locked_words:
-            all_locked_text = " ".join(w["word"] for w in self.locked_words)
-            locked_end = self.locked_words[-1]["end_ms"] if self.locked_words else 0
-            print(f"   🔒 TOTAL LOCKED: \"{all_locked_text}\" [0 - {locked_end}ms]")
-        else:
-            print(f"   🔒 LOCKED: (nothing yet)")
-            
-        print(f"   ✅ MERGED: \"{merged_text}\"")
-        
-        # Debug: show candidate regions
-        self._log_regions()
-        
+            print(f"   🔒 Newly locked: {' '.join(w['word'] for w in newly_locked)}")
+        print(f"   🔒 Stable:   \"{stable_text}\"")
+        print(f"   🌊 Unstable: \"{unstable_text}\"")
+
         return {
-            "segment_id": hypothesis["segment_id"],
-            "committed": merged_text,
-            "partial": "",
+            "segment_id": self.segment_id or segment_id,
+
+            # 🔥 AUTHORITATIVE EVENTS
+            "finalized_words": newly_locked,
+            "stable_words": stable_words,
+            "unstable_words": unstable_words,
+
+            # 👁️ VIEW ONLY
+            "rendered_text": {
+                "stable": stable_text,
+                "unstable": unstable_text,
+                "full": full_text,
+            },
+
             "revision": revision,
             "final": False,
         }
+
+    def finalize(self) -> SegmentOutput | None:
+        """
+        Finalize the segment (call on silence or disconnect).
+        
+        Locks all remaining regions and returns final output.
+        """
+        # Lock all remaining regions
+        final_locked: list[WordInfo] = []
+        for region in self.word_regions:
+            if region["candidates"]:
+                best = max(region["candidates"], key=lambda c: c["probability"])
+                word_info: WordInfo = {
+                    "word": best["word"],
+                    "start_ms": best["start_ms"],
+                    "end_ms": best["end_ms"],
+                    "probability": best["probability"],
+                }
+                self.locked_words.append(word_info)
+                final_locked.append(word_info)
+        
+        self.word_regions = []
+        
+        if not self.locked_words:
+            return None
+        
+        # Sort by time
+        self.locked_words.sort(key=lambda w: w["start_ms"])
+        final_locked.sort(key=lambda w: w["start_ms"])
+        
+        # Build final text
+        stable_text = " ".join(w["word"] for w in self.locked_words)
+        
+        # Log final state
+        if final_locked:
+            print(f"   🏁 FINALIZED: \"{' '.join(w['word'] for w in final_locked)}\"")
+        print(f"   ✅ Final transcript: \"{stable_text}\"")
+        
+        output: SegmentOutput = {
+            "segment_id": self.segment_id or f"seg-final-{id(self)}",
+            "finalized_words": final_locked,
+            "stable_words": list(self.locked_words),
+            "unstable_words": [],
+            "rendered_text": {
+                "stable": stable_text,
+                "unstable": "",
+                "full": stable_text,
+            },
+            "revision": -1,
+            "final": True,
+        }
+        
+        # Reset state for next segment
+        self.word_regions = []
+        self.locked_words = []
+        self.segment_id = None
+        
+        return output
 
     def _filter_valid_words(self, words: list) -> list:
         """Filter out invalid words (zero duration, punctuation only)."""
@@ -139,10 +290,8 @@ class SegmentManager:
         """
         Get overlap threshold based on word length.
         
-        Short words (like "Hey", "the", "it") need lower threshold
-        because their timestamps vary more relative to their duration.
-        
-        Long words (like "something", "experienced") can use higher threshold.
+        Short words need lower threshold because their
+        timestamps vary more relative to their duration.
         """
         word_text = word.get("word", "").strip(".,!?\"'")
         word_length = len(word_text)
@@ -153,12 +302,11 @@ class SegmentManager:
             return 0.30
         elif word_length <= 7:     # "Vsauce", "Michael", "truly"
             return 0.40
-        else:                      # "something", "experienced", "becomes"
+        else:                      # "something", "experienced"
             return 0.50
 
     def _add_word_candidate(self, word: dict, revision: int):
         """Add a word as a candidate to its matching region, or create new region."""
-        # Find existing region that overlaps with this word
         matching_region = None
         for region in self.word_regions:
             if self._is_same_region(word, region):
@@ -166,7 +314,7 @@ class SegmentManager:
                 break
         
         if matching_region:
-            # Add to existing region, update region bounds
+            # Add to existing region
             matching_region["candidates"].append({
                 "word": word["word"],
                 "start_ms": word["start_ms"],
@@ -174,7 +322,7 @@ class SegmentManager:
                 "probability": word.get("probability", 0.5),
                 "revision": revision,
             })
-            # Expand region bounds to cover all candidates
+            # Expand region bounds
             matching_region["start_ms"] = min(matching_region["start_ms"], word["start_ms"])
             matching_region["end_ms"] = max(matching_region["end_ms"], word["end_ms"])
         else:
@@ -216,35 +364,34 @@ class SegmentManager:
         overlap_ratio = overlap_duration / shorter_duration
         return overlap_ratio > threshold
 
-    def _lock_exited_regions(self, buffer_start_ms: int) -> list:
+    def _lock_exited_regions(self, buffer_start_ms: int) -> list[WordInfo]:
         """Lock regions that have exited the buffer, selecting best candidate."""
-        newly_locked = []
+        newly_locked: list[WordInfo] = []
         remaining_regions = []
         
         for region in self.word_regions:
             # Region has exited if its end is before buffer start (with margin)
             if region["end_ms"] < buffer_start_ms + self.lock_margin_ms:
                 # Select best candidate by probability
-                best_candidate = max(region["candidates"], key=lambda c: c["probability"])
+                best = max(region["candidates"], key=lambda c: c["probability"])
                 
-                locked_word = {
-                    "word": best_candidate["word"],
-                    "start_ms": best_candidate["start_ms"],
-                    "end_ms": best_candidate["end_ms"],
-                    "probability": best_candidate["probability"],
-                    "locked": True,
+                word_info: WordInfo = {
+                    "word": best["word"],
+                    "start_ms": best["start_ms"],
+                    "end_ms": best["end_ms"],
+                    "probability": best["probability"],
                 }
                 
-                self.locked_words.append(locked_word)
-                newly_locked.append(locked_word)
+                self.locked_words.append(word_info)
+                newly_locked.append(word_info)
                 
-                # Log the selection
+                # Log selection
                 if len(region["candidates"]) > 1:
                     candidates_str = ", ".join(
                         f"\"{c['word']}\"({c['probability']:.2f})" 
                         for c in region["candidates"]
                     )
-                    print(f"   🏆 Selected \"{best_candidate['word']}\" from candidates: {candidates_str}")
+                    print(f"   🏆 Selected \"{best['word']}\" from candidates: {candidates_str}")
             else:
                 remaining_regions.append(region)
         
@@ -252,16 +399,16 @@ class SegmentManager:
         
         # Sort locked words by time
         self.locked_words.sort(key=lambda w: w["start_ms"])
+        newly_locked.sort(key=lambda w: w["start_ms"])
         
         return newly_locked
 
-    def _get_best_in_buffer_words(self, buffer_start_ms: int) -> list:
+    def _get_best_in_buffer_words(self) -> list[WordInfo]:
         """Get the best candidate for each region still in buffer."""
-        best_words = []
+        best_words: list[WordInfo] = []
         
         for region in self.word_regions:
             if region["candidates"]:
-                # Get the highest probability candidate
                 best = max(region["candidates"], key=lambda c: c["probability"])
                 best_words.append({
                     "word": best["word"],
@@ -272,51 +419,3 @@ class SegmentManager:
         
         best_words.sort(key=lambda w: w["start_ms"])
         return best_words
-
-    def _log_regions(self):
-        """Log current word regions for debugging."""
-        if self.word_regions:
-            print(f"   📍 Active regions: {len(self.word_regions)}")
-            for i, region in enumerate(self.word_regions[:5]):  # Show first 5
-                candidates = ", ".join(
-                    f"\"{c['word']}\"({c['probability']:.2f})"
-                    for c in region["candidates"][-3:]  # Show last 3 candidates
-                )
-                print(f"      Region {i}: [{region['start_ms']}-{region['end_ms']}ms] → {candidates}")
-
-    def finalize(self) -> dict | None:
-        """
-        Finalize the segment (call on silence or disconnect).
-        """
-        # Lock all remaining regions
-        for region in self.word_regions:
-            if region["candidates"]:
-                best = max(region["candidates"], key=lambda c: c["probability"])
-                self.locked_words.append({
-                    "word": best["word"],
-                    "start_ms": best["start_ms"],
-                    "end_ms": best["end_ms"],
-                    "probability": best["probability"],
-                    "locked": True,
-                })
-        
-        self.word_regions = []
-        
-        if not self.locked_words:
-            return None
-        
-        self.locked_words.sort(key=lambda w: w["start_ms"])
-        final_text = " ".join(w["word"] for w in self.locked_words)
-        
-        result = {
-            "segment_id": f"seg-final-{id(self)}",
-            "committed": final_text,
-            "partial": "",
-            "revision": -1,
-            "final": True,
-        }
-        
-        # Reset state
-        self.locked_words = []
-        
-        return result
