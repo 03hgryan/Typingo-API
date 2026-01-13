@@ -243,64 +243,75 @@ class GoogleAdapter(ASRAdapter):
         
         Strategy:
         1. Return pending finals first (from previous call)
-        2. Call engine.feed() which adds audio AND returns one result
-        3. Drain any additional results from queue
-        4. Process all results: queue finals, keep latest interim
-        5. Return: pending final > latest interim > None
+        2. Check engine's finals_queue for any finals we might have missed
+        3. Feed audio to engine
+        4. Check finals_queue again
+        5. Drain regular response queue for latest interim
+        6. Return: pending final > latest interim > None
+        
+        Key insight: Finals go to a separate queue so they can't be lost
+        even if interims arrive between feed() calls.
         """
         self._is_streaming = True
         
-        # If we have pending finals from last call, return them first
+        # Step 1: Return pending finals from previous call
         if self._pending_finals:
             result = self._pending_finals.pop(0)
             self._last_hypothesis = result
             return result
         
-        # Feed audio to engine - this adds to queue AND returns one result
-        first_result = self._engine.feed(audio)
+        # Step 2: Check for finals that arrived since last call
+        self._drain_finals_queue()
+        if self._pending_finals:
+            result = self._pending_finals.pop(0)
+            self._last_hypothesis = result
+            return result
         
-        # Collect all results (first + any others in queue)
-        all_results: list[dict] = []
-        if first_result:
-            all_results.append(first_result)
+        # Step 3: Feed audio to engine
+        self._engine.feed(audio)
         
-        # Drain additional results from queue
+        # Step 4: Small delay then check finals again
+        import time as time_mod
+        time_mod.sleep(0.02)  # 20ms
+        
+        self._drain_finals_queue()
+        if self._pending_finals:
+            result = self._pending_finals.pop(0)
+            self._last_hypothesis = result
+            return result
+        
+        # Step 5: No finals - get latest interim from response queue
+        latest_interim = None
         while True:
             try:
                 result = self._engine._response_queue.get_nowait()
-                if result:
-                    all_results.append(result)
+                if result and not result.get("is_final_from_google", False):
+                    latest_interim = result
+                # Skip finals in response queue (already in finals_queue)
             except self._queue_module.Empty:
                 break
         
-        if not all_results:
-            return None
-        
-        # Separate finals and interims
-        finals = [r for r in all_results if r.get("is_final_from_google", False)]
-        interims = [r for r in all_results if not r.get("is_final_from_google", False)]
-        
-        # Queue all finals (they need to be processed in order)
-        for f in finals:
+        # Step 6: Return latest interim
+        if latest_interim:
             self._revision += 1
-            normalized = self._normalize_hypothesis(f, is_final=True)
-            self._pending_finals.append(normalized)
-        
-        # If we have finals, return the first one
-        if self._pending_finals:
-            result = self._pending_finals.pop(0)
-            self._last_hypothesis = result
-            return result
-        
-        # No finals - return the latest interim
-        if interims:
-            self._revision += 1
-            latest = interims[-1]
-            result = self._normalize_hypothesis(latest, is_final=False)
+            result = self._normalize_hypothesis(latest_interim, is_final=False)
             self._last_hypothesis = result
             return result
         
         return None
+    
+    def _drain_finals_queue(self):
+        """Drain all finals from engine's finals queue into pending_finals."""
+        while True:
+            try:
+                final = self._engine._finals_queue.get_nowait()
+                if final:
+                    self._revision += 1
+                    normalized = self._normalize_hypothesis(final, is_final=True)
+                    self._pending_finals.append(normalized)
+                    print(f"   📬 Captured final: \"{final.get('text', '')[:50]}...\"")
+            except self._queue_module.Empty:
+                break
     
     def _normalize_hypothesis(self, hypothesis: dict, is_final: bool) -> dict:
         """Normalize hypothesis to standard format."""
@@ -318,23 +329,39 @@ class GoogleAdapter(ASRAdapter):
         }
     
     def reset(self) -> None:
-        """Reset Google engine state."""
+        """Reset Google engine state and stop streaming."""
+        self._stop_streaming()
         self._engine.reset()
         self._is_streaming = False
         self._last_hypothesis = None
         self._revision = 0
         self._pending_finals = []
     
+    def _stop_streaming(self) -> None:
+        """Stop the Google streaming thread gracefully."""
+        try:
+            # Signal the engine to stop
+            self._engine._is_streaming = False
+            # Send poison pill to unblock the audio generator
+            self._engine._audio_queue.put(None)
+        except:
+            pass
+    
     def finalize(self) -> dict | None:
         """
-        Finalize current segment.
+        Finalize current segment and stop streaming.
         
-        Important: Google may need time to flush final results.
-        We drain the queue with a short timeout to catch late finals.
+        Important: We may have already processed all finals during feed().
+        Only return a final here if there's a pending one we haven't returned yet.
         """
         import time as time_module
         
         self._is_streaming = False
+        
+        # Check if we already have pending finals (shouldn't re-process)
+        if self._pending_finals:
+            self._stop_streaming()
+            return self._pending_finals.pop(0)
         
         # Send silence frame to nudge Google into finalization
         try:
@@ -342,35 +369,20 @@ class GoogleAdapter(ASRAdapter):
         except:
             pass
         
-        # Drain with timeout - wait up to 500ms for final result
-        deadline = time_module.time() + 0.5
+        # Brief wait to see if a NEW final arrives
+        deadline = time_module.time() + 0.3
         while time_module.time() < deadline:
-            try:
-                result = self._engine._response_queue.get(timeout=0.1)
-                if result:
-                    if result.get("is_final_from_google", False):
-                        self._revision += 1
-                        normalized = self._normalize_hypothesis(result, is_final=True)
-                        self._pending_finals.append(normalized)
-                    # Keep draining even for interims
-            except self._queue_module.Empty:
-                # No more results available right now
-                if self._pending_finals:
-                    break  # We have finals, no need to wait more
-                # Brief wait before checking again
-                time_module.sleep(0.05)
+            self._drain_finals_queue()
+            if self._pending_finals:
+                self._stop_streaming()
+                return self._pending_finals.pop(0)
+            time_module.sleep(0.05)
         
-        # Return pending finals first
-        if self._pending_finals:
-            return self._pending_finals.pop(0)
+        # Stop streaming before returning
+        self._stop_streaming()
         
-        # Fallback: return last hypothesis marked as final
-        if self._last_hypothesis:
-            final_hypothesis = self._last_hypothesis.copy()
-            final_hypothesis["is_final"] = True  # Standardized flag
-            self._last_hypothesis = None
-            return final_hypothesis
-        
+        # No new finals - just return None (don't fabricate a final from last_hypothesis
+        # as that would cause duplication if it was already processed)
         return None
 
 

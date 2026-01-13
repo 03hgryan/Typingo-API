@@ -103,6 +103,7 @@ class GoogleCloudASR(ASREngine):
         # Streaming state
         self._audio_queue: queue.Queue[bytes | None] = queue.Queue()
         self._response_queue: queue.Queue[Hypothesis | None] = queue.Queue()
+        self._finals_queue: queue.Queue[Hypothesis | None] = queue.Queue()  # Separate queue for finals!
         self._streaming_thread: threading.Thread | None = None
         self._is_streaming = False
         
@@ -235,10 +236,30 @@ class GoogleCloudASR(ASREngine):
 
             except Exception as e:
                 error_str = str(e).lower()
-                if "iterating requests" in error_str or "cancelled" in error_str:
-                    # Normal end of stream
+                
+                # Check if this is a normal termination condition
+                is_normal_end = (
+                    "iterating requests" in error_str or 
+                    "cancelled" in error_str
+                )
+                
+                # Audio timeout means no audio is being sent - likely stream ended
+                is_audio_timeout = "audio timeout" in error_str
+                
+                if is_normal_end:
+                    # Normal end of stream - continue only if still streaming
                     if self._is_streaming:
                         continue
+                elif is_audio_timeout:
+                    # Audio timeout - only restart if we're still actively streaming
+                    # AND there's audio in the queue waiting
+                    if self._is_streaming and not self._audio_queue.empty():
+                        print(f"⚠️ Audio timeout, but queue has data - restarting...")
+                        continue
+                    else:
+                        print(f"🛑 Audio timeout - stopping stream (no pending audio)")
+                        self._is_streaming = False
+                        break
                 else:
                     print(f"❌ Google Cloud streaming error: {e}")
                 
@@ -338,6 +359,9 @@ class GoogleCloudASR(ASREngine):
                     })
                     current_ms += word_duration_ms
 
+            # Get Google's is_final flag - THIS IS THE AUTHORITATIVE INDICATOR
+            is_final = result.is_final
+
             self.revision += 1
 
             # Calculate corrected display time
@@ -352,10 +376,10 @@ class GoogleCloudASR(ASREngine):
                 "confidence": alternative.confidence if alternative.confidence else 0.9,
                 "start_time_ms": self.session_start_time_ms,
                 "end_time_ms": self.session_start_time_ms + corrected_time_ms,
+                "is_final_from_google": is_final,  # CRITICAL: Pass Google's is_final flag
             }
 
             # Log
-            is_final = result.is_final
             if is_final:
                 self._is_final_end_time_ms = self._result_end_time_ms
                 
@@ -369,8 +393,11 @@ class GoogleCloudASR(ASREngine):
                 for w in words_with_timestamps:
                     print(f"   [{w['start_ms']:5d} - {w['end_ms']:5d}ms] \"{w['word']}\" (prob: {w['probability']:.2f})")
 
-            # Put hypothesis in queue for main thread
+            # Put hypothesis in queues for main thread
+            # Finals go to BOTH queues so they can't be missed
             self._response_queue.put(hypothesis)
+            if is_final:
+                self._finals_queue.put(hypothesis)
 
     def _start_streaming(self):
         """Start the streaming thread if not already running."""
@@ -425,10 +452,17 @@ class GoogleCloudASR(ASREngine):
                 self._response_queue.get_nowait()
             except queue.Empty:
                 break
+        
+        while not self._finals_queue.empty():
+            try:
+                self._finals_queue.get_nowait()
+            except queue.Empty:
+                break
 
         # Reset all state
         self._audio_queue = queue.Queue()
         self._response_queue = queue.Queue()
+        self._finals_queue = queue.Queue()
         self.segment_id = f"google-seg-{int(time.time() * 1000)}"
         self.revision = 0
         self.session_start_time_ms = int(time.time() * 1000)

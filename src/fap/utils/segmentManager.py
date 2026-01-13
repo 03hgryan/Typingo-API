@@ -158,20 +158,33 @@ class SegmentManager:
         buffer_end_ms: int,
     ) -> SegmentOutput:
         """
-        Handle Google-style rewriting ASR.
+        Handle Google-style rewriting ASR with time-based soft locking.
         
         Each hypothesis REPLACES the previous one entirely.
-        Only trust words when is_final=True.
+        Hard lock only on is_final=True.
         
-        Key insight: Google owns the hypothesis until it marks it final.
-        We don't try to track word regions or do any diffing.
+        NEW: Time-based soft locking for progressive stability:
+        - Track how long each word position has been stable
+        - If a prefix of words is consistent for STABILITY_THRESHOLD_MS, soft-lock them
+        - This gives progressive feedback like Whisper, while respecting Google's finals
         """
+        import time
+        
         text = hypothesis.get("text", "").strip()
         words = hypothesis.get("words", [])
         is_final = hypothesis.get("is_final", False)
         
         finalized_words: list[WordInfo] = []
         unstable_words: list[WordInfo] = []
+        
+        # Time-based stability settings
+        current_time_ms = int(time.time() * 1000)
+        STABILITY_THRESHOLD_MS = 800  # 1.5 seconds of consistency = soft lock
+        
+        # Initialize tracking attributes if needed
+        if not hasattr(self, '_interim_word_history'):
+            self._interim_word_history: list[tuple[str, int]] = []  # (word, first_seen_ms)
+            self._soft_locked_count = 0
         
         if is_final and words:
             # ✅ Final result with word timestamps - lock all words
@@ -192,16 +205,33 @@ class SegmentManager:
                     print(f"⚠️ Warning: Cross-segment overlap detected! "
                           f"Last locked end: {last_locked_end}ms, "
                           f"New start: {first_new_start}ms")
+                    # SKIP these words - they're duplicates!
+                    print(f"   ⏭️ Skipping {len(finalized_words)} duplicate words")
+                    finalized_words = []
             
-            # Extend locked words (append, don't replace)
-            self.locked_words.extend(finalized_words)
-            self.locked_words.sort(key=lambda w: w["start_ms"])
-            
-            print(f"📊 Revision {revision} (FINAL)")
-            print(f"   🔒 Locked: {' '.join(w['word'] for w in finalized_words)}")
+            if finalized_words:
+                # On final, we need to replace soft-locked words with real timestamps
+                # Remove soft-locked words (they have approximate timestamps)
+                if self._soft_locked_count > 0:
+                    self.locked_words = self.locked_words[:-self._soft_locked_count] if self._soft_locked_count <= len(self.locked_words) else []
+                
+                # Add all finalized words
+                self.locked_words.extend(finalized_words)
+                self.locked_words.sort(key=lambda w: w["start_ms"])
+                
+                # Reset interim tracking
+                self._interim_word_history = []
+                self._soft_locked_count = 0
+                
+                print(f"📊 Revision {revision} (FINAL)")
+                print(f"   🔒 Hard-locked: {' '.join(w['word'] for w in finalized_words)}")
             
         elif is_final and text:
             # ✅ Final result but no word timestamps - create single entry
+            # Remove soft-locked first
+            if self._soft_locked_count > 0:
+                self.locked_words = self.locked_words[:-self._soft_locked_count] if self._soft_locked_count <= len(self.locked_words) else []
+            
             word_info: WordInfo = {
                 "word": text,
                 "start_ms": buffer_start_ms,
@@ -212,21 +242,79 @@ class SegmentManager:
             self.locked_words.extend(finalized_words)
             self.locked_words.sort(key=lambda w: w["start_ms"])
             
+            # Reset interim tracking
+            self._interim_word_history = []
+            self._soft_locked_count = 0
+            
             print(f"📊 Revision {revision} (FINAL, no word timestamps)")
             print(f"   🔒 Locked: \"{text}\"")
             
         else:
-            # ⏳ Interim result - show as unstable preview, don't lock
-            if text:
-                unstable_words = [{
-                    "word": text,
-                    "start_ms": buffer_start_ms,
-                    "end_ms": buffer_end_ms,
-                    "probability": 0.5,
-                }]
+            # ⏳ Interim result - apply time-based soft locking
+            current_words = text.split() if text else []
             
-            print(f"📊 Revision {revision} (interim)")
-            print(f"   🌊 Preview: \"{text}\"")
+            # Update word history - track when each position was first seen
+            new_history: list[tuple[str, int]] = []
+            for i, word in enumerate(current_words):
+                if i < len(self._interim_word_history):
+                    old_word, first_seen = self._interim_word_history[i]
+                    # Normalize comparison (case-insensitive, ignore trailing punctuation for matching)
+                    old_normalized = old_word.lower().rstrip('.,!?')
+                    new_normalized = word.lower().rstrip('.,!?')
+                    if old_normalized == new_normalized:
+                        # Same word - keep original timestamp
+                        new_history.append((word, first_seen))
+                    else:
+                        # Word changed - reset timestamp
+                        new_history.append((word, current_time_ms))
+                else:
+                    # New position - start tracking
+                    new_history.append((word, current_time_ms))
+            
+            self._interim_word_history = new_history
+            
+            # Find contiguous prefix of stable words
+            soft_locked_count = 0
+            for i, (word, first_seen) in enumerate(self._interim_word_history):
+                age_ms = current_time_ms - first_seen
+                if age_ms >= STABILITY_THRESHOLD_MS:
+                    soft_locked_count = i + 1
+                else:
+                    break  # Must be contiguous from start
+            
+            # Soft-lock new words
+            newly_soft_locked: list[WordInfo] = []
+            if soft_locked_count > self._soft_locked_count:
+                for i in range(self._soft_locked_count, soft_locked_count):
+                    word = self._interim_word_history[i][0]
+                    word_info: WordInfo = {
+                        "word": word,
+                        "start_ms": buffer_start_ms + (i * 200),  # Approximate
+                        "end_ms": buffer_start_ms + ((i + 1) * 200),
+                        "probability": 0.85,  # Mark as soft-locked
+                    }
+                    newly_soft_locked.append(word_info)
+                    self.locked_words.append(word_info)
+                
+                self._soft_locked_count = soft_locked_count
+                finalized_words = newly_soft_locked
+                
+                print(f"📊 Revision {revision} (interim, +{len(newly_soft_locked)} soft-locked)")
+                print(f"   🔓 Soft-locked: {' '.join(w['word'] for w in newly_soft_locked)}")
+            else:
+                print(f"📊 Revision {revision} (interim)")
+            
+            # Unstable = words after soft-locked portion
+            if soft_locked_count < len(current_words):
+                unstable_text = " ".join(current_words[soft_locked_count:])
+                if unstable_text:
+                    unstable_words = [{
+                        "word": unstable_text,
+                        "start_ms": buffer_start_ms,
+                        "end_ms": buffer_end_ms,
+                        "probability": 0.5,
+                    }]
+                    print(f"   🌊 Preview: \"{unstable_text}\"")
         
         # Build output
         stable_text = " ".join(w["word"] for w in self.locked_words)
@@ -383,9 +471,12 @@ class SegmentManager:
                 "final": True,
             }
             
-            # Reset state
+            # Reset state (including time-based tracking)
             self.locked_words = []
             self.segment_id = None
+            if hasattr(self, '_interim_word_history'):
+                self._interim_word_history = []
+                self._soft_locked_count = 0
             
             return output
 
