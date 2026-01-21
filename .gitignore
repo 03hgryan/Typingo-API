@@ -37,3 +37,6 @@ Thumbs.db
 logs/
 
 alembic/versions/
+
+# Possible credential files 
+*.json
