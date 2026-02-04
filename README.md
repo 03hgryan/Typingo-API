@@ -6,6 +6,9 @@ Update Log:
 
 Performance Optimizations:
 
+- Punctuation-only boundaries: only encode prefixes ending with sentence
+  punctuation (.!?) instead of all word prefixes (reduced from N prefixes
+  to 2-4 sentence boundaries, ~5-7x fewer computations)
 - Batch encoding: encode all prefixes + Korean in single model.encode() call
   (reduced from N+1 calls to 1 call per ASR update)
 - Add debug flag (default False) to disable verbose logging in production

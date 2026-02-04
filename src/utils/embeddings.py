@@ -88,11 +88,10 @@ def find_source_boundary(
     """
     Find where in source_text the previous_translation ends.
     
-    Uses prefix-based matching:
-    1. Generate all prefixes of source_text
-    2. Compare each prefix to previous_translation using embeddings
-    3. Find the peak similarity score
-    4. Among prefixes ending with punctuation, pick the one closest to peak score
+    Uses punctuation-boundary matching:
+    1. Generate only prefixes ending with sentence punctuation (.!?)
+    2. Compare each to previous_translation using embeddings
+    3. Pick the one with highest similarity score
     
     Args:
         source_text: Full English transcript from ASR
@@ -113,66 +112,62 @@ def find_source_boundary(
     if not words:
         return "", source_text, 0.0
     
-    # Generate all prefixes
-    prefixes = [" ".join(words[:i]) for i in range(1, len(words) + 1)]
+    # Only generate prefixes ending with sentence punctuation
+    punctuation_chars = '.!?。！？'
+    punctuated_prefixes = []  # List of (word_index, prefix_text)
     
-    # Batch encode: all prefixes + previous translation in ONE call
-    all_texts = prefixes + [previous_translation]
-    all_embeddings = model.encode(all_texts)
+    for i, word in enumerate(words):
+        # Check if word ends with punctuation (handle cases like "hello." or "what?")
+        if word and word.rstrip()[-1] in punctuation_chars:
+            prefix = " ".join(words[:i+1])
+            punctuated_prefixes.append((i + 1, prefix))  # i+1 for 1-indexed
+    
+    # Also add full transcript as fallback (in case no punctuation yet)
+    full_prefix = " ".join(words)
+    if not punctuated_prefixes or punctuated_prefixes[-1][1] != full_prefix:
+        punctuated_prefixes.append((len(words), full_prefix))
+    
+    if debug:
+        print(f"\n      📊 Checking {len(punctuated_prefixes)} punctuation boundaries (out of {len(words)} words):")
+    
+    # Batch encode: punctuated prefixes + previous translation
+    texts_to_encode = [p[1] for p in punctuated_prefixes] + [previous_translation]
+    all_embeddings = model.encode(texts_to_encode)
     
     # Split embeddings
-    prefix_embeddings = all_embeddings[:-1]  # All but last
-    prev_emb = all_embeddings[-1:]            # Last one (keep 2D shape)
+    prefix_embeddings = all_embeddings[:-1]
+    prev_emb = all_embeddings[-1:]
     
-    # Calculate all similarities at once
+    # Calculate similarities
     similarities = cosine_similarity(prefix_embeddings, prev_emb).flatten()
     
     # Build scores list
-    if debug:
-        print(f"\n      📊 Prefix similarities:")
     scores = []
-    for i, (prefix, score) in enumerate(zip(prefixes, similarities), start=1):
-        scores.append((i, prefix, float(score)))
+    for (idx, prefix), score in zip(punctuated_prefixes, similarities):
+        scores.append((idx, prefix, float(score)))
         if debug:
-            print(f"         [{i:2d}] {score:.3f} | \"{prefix}\"")
+            print(f"         [{idx:2d}] {score:.3f} | \"{prefix}\"")
     
-    # Find peak score
-    peak_idx, peak_prefix, peak_score = max(scores, key=lambda x: x[2])
+    # Find best score (highest similarity)
+    best_idx, best_prefix, best_score = max(scores, key=lambda x: x[2])
     if debug:
-        print(f"\n      🎯 Peak: [{peak_idx}] {peak_score:.3f} | \"{peak_prefix}\"")
-    
-    # Find all prefixes ending with sentence punctuation
-    punctuation_chars = '.!?。！？'
-    punctuated = []
-    for i, prefix, score in scores:
-        if prefix and prefix.rstrip()[-1] in punctuation_chars:
-            distance = abs(peak_score - score)
-            punctuated.append((i, prefix, score, distance))
-    
-    # Pick the punctuated prefix closest to peak score
-    if punctuated:
-        best_punct = min(punctuated, key=lambda x: x[3])  # min distance from peak
-        final_idx = best_punct[0]
-        final_prefix = best_punct[1]
-        final_score = best_punct[2]
-        if debug:
-            print(f"      🛑 Selected punctuation boundary [{final_idx}] {final_score:.3f} | \"{final_prefix}\"")
-    else:
-        # No punctuation found, use peak
-        final_idx = peak_idx
-        if debug:
-            print(f"      ⚠️ No punctuation found, using peak")
+        print(f"\n      🎯 Best match: [{best_idx}] {best_score:.3f} | \"{best_prefix}\"")
     
     # If best score is below threshold, no reliable match
-    if peak_score < threshold:
+    if best_score < threshold:
         if debug:
-            print(f"      ⚠️  Below threshold ({peak_score:.3f} < {threshold})")
-        return "", source_text, peak_score
+            print(f"      ⚠️  Below threshold ({best_score:.3f} < {threshold})")
+        return "", source_text, best_score
+    
+    # Use the best punctuation boundary
+    final_idx = best_idx
+    if debug:
+        print(f"      🛑 Selected boundary [{final_idx}]")
     
     matched = " ".join(words[:final_idx])
     remaining = " ".join(words[final_idx:])
     
-    return matched, remaining, peak_score
+    return matched, remaining, best_score
 
 
 class EmbeddingMatcher:
