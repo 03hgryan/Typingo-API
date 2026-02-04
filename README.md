@@ -2,6 +2,15 @@ API for AST, ASR + translation
 
 Update Log:
 
+02 03
+
+Performance Optimizations:
+
+- Batch encoding: encode all prefixes + Korean in single model.encode() call
+  (reduced from N+1 calls to 1 call per ASR update)
+- Add debug flag (default False) to disable verbose logging in production
+- Wrap 100+ print statements in debug checks to eliminate I/O blocking
+
 01 27 ~ 02 03
 
 Implement cross-language embedding matching to avoid re-translating
