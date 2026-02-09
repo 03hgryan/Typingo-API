@@ -21,8 +21,9 @@ Rules:
 
 
 class Translator:
-    def __init__(self, on_translation=None):
+    def __init__(self, on_translation=None, partial_interval=3):
         self.on_translation = on_translation
+        self.partial_interval = partial_interval
         self.seq = 0
         self.latest_seq = -1
         self.partial_count = 0
@@ -46,10 +47,10 @@ class Translator:
         self.partial_count += 1
 
         # First partial: translate immediately for fast initial display
-        # After that: every 3 partials
+        # After that: every N partials
         if self.partial_count == 1:
             pass  # Fall through to translate
-        elif self.partial_count % 3 != 0:
+        elif self.partial_count % self.partial_interval != 0:
             return None
 
         words = partial_text.split()

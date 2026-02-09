@@ -37,7 +37,6 @@ def find_anchor_and_merge(combined: str, new_translation: str, threshold: float 
 
     best_score = 0.0
     best_combined_cut = len(combined_words)  # Default: keep all of combined
-    best_new_start = 0  # Default: append all of new
     best_match_len = 0
 
     # Search last 40 words of combined
@@ -50,9 +49,13 @@ def find_anchor_and_merge(combined: str, new_translation: str, threshold: float 
     for prefix_len in range(3, max_prefix + 1):
         new_prefix = " ".join(new_words[:prefix_len])
 
+        # Scale threshold by prefix length:
+        # Short matches need higher similarity to avoid false positives
+        # 3 words → 0.85, 5 words → 0.78, 8+ words → 0.65
+        scaled_threshold = max(0.65, threshold + 0.15 * (1 - (prefix_len - 3) / max(max_prefix - 3, 1)))
+
         # Search for this prefix in the tail of combined
         for win_start in range(search_start, len(combined_words)):
-            # Try windows of similar length (prefix_len ± 2)
             for win_len in range(max(2, prefix_len - 2), min(prefix_len + 3, len(combined_words) - win_start + 1)):
                 win_end = win_start + win_len
                 if win_end > len(combined_words):
@@ -61,11 +64,13 @@ def find_anchor_and_merge(combined: str, new_translation: str, threshold: float 
                 window = " ".join(combined_words[win_start:win_end])
                 score = similarity(window, new_prefix)
 
+                if score < scaled_threshold:
+                    continue
+
                 # Weighted score: prefer longer matches
-                # A 5-word match at 0.8 is better than a 3-word match at 0.9
                 weighted = score * (prefix_len / max_prefix)
 
-                if score >= threshold and weighted > best_score:
+                if weighted > best_score:
                     best_score = weighted
                     best_combined_cut = win_start
                     best_match_len = prefix_len
