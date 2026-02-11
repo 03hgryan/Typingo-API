@@ -9,7 +9,6 @@ us to only translate NEW content.
 import time
 from typing import Optional, Tuple, List
 from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
 
 # Global model instance (loaded once at startup)
 _model: Optional[SentenceTransformer] = None
@@ -54,6 +53,8 @@ def compute_similarity(text_a: str, text_b: str) -> float:
     Compute cosine similarity between two texts (any language).
     Returns value between -1 and 1 (higher = more similar).
     """
+    from sklearn.metrics.pairwise import cosine_similarity
+
     model = get_model()
     emb_a = model.encode([text_a])
     emb_b = model.encode([text_b])
@@ -103,6 +104,8 @@ def find_source_boundary(
     Returns:
         (matched_source, remaining_source, best_score)
     """
+    from sklearn.metrics.pairwise import cosine_similarity
+
     if not previous_translation or not source_text:
         return "", source_text, 0.0
     
