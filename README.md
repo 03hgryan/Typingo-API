@@ -1,6 +1,34 @@
 API for AST, ASR + translation
 
 Update Log:
+02 10
+
+Architecture - Sentence-based translation pipeline:
+
+Sentence Segmentation (speechmaticsTest.py)
+
+- Punctuation-based sentence confirmation from STT stream
+- Tracks confirmed_word_count pointer into full_text, rebuilds remaining_text each update
+- Configurable CONFIRM_PUNCT_COUNT (default 2): number of punctuation+text matches needed
+- Confirmed sentences sent to translator once — permanent, never retranslated
+- Partial (remaining) text translated every PARTIAL_INTERVAL (default 6) STT updates as preview
+- Eliminates overlap re-translation problem entirely: no combiner, no fuzzy matching
+
+Translation (translationExp.py)
+
+- Two async translation paths: translate_confirmed() and translate_partial()
+- partial_stale boolean: set True on confirmed, prevents stale partial results from displaying
+- translated_confirmed grows permanently, translated_partial is temporary preview
+- Websocket callbacks send confirmed_translation and partial_translation to frontend
+
+Why this approach:
+
+- Previous rolling-window + combiner failed because GPT re-translates overlapping
+  English words differently each time, making fuzzy Korean stitching unreliable
+- Boundary locking failed because STT glitches get permanently locked and GPT
+  misaligns markers with small context segments
+- Sentence-based approach: each GPT call gets a complete thought with full context,
+  no overlap, no stitching, no accumulation bugs
 
 02 05 ~ 02 09
 
