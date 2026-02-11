@@ -1,6 +1,5 @@
 import os
 import time
-import asyncio
 from openai import AsyncOpenAI
 
 oai = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))

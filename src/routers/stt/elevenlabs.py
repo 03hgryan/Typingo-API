@@ -53,7 +53,7 @@ async def stream(ws: WebSocket):
         print("-"*60)
 
         await ws.send_json({"type": "session_started", "data": session_data})
-        print(f"📤 → Frontend: session_started")
+        print("📤 → Frontend: session_started")
 
         # Run audio forwarding and transcript processing
         await asyncio.gather(

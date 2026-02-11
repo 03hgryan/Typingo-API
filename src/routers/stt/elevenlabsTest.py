@@ -139,12 +139,12 @@ async def forward_transcripts(client_ws: WebSocket, elevenlabs_ws, translator: T
             if full_text == prev_text:
                 if not silent:
                     silent = True
-                    print(f"🔇 Silence")
+                    print("🔇 Silence")
                 continue
             else:
                 if silent:
                     silent = False
-                    print(f"🔊 Speech resumed")
+                    print("🔊 Speech resumed")
                 prev_text = full_text
 
             await client_ws.send_json({"type": "partial", "text": full_text})

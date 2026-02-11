@@ -1,7 +1,7 @@
 import os
 import json
+import re
 import base64
-import time
 import asyncio
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from speechmatics.rt import (
@@ -11,11 +11,9 @@ from speechmatics.rt import (
     TranscriptResult,
     OperatingPoint,
     AudioFormat,
-    AudioEncoding,
-    AuthenticationError,
 )
-from utils.translationTest import Translator
-from utils.combiner import Combiner
+from utils.translationExp import Translator
+from utils.tone import ToneDetector
 
 router = APIRouter()
 
@@ -25,203 +23,130 @@ SPEECHMATICS_API_KEY = os.getenv("SPEECHMATICS_API_KEY")
 @router.websocket("")
 async def stream(ws: WebSocket):
     await ws.accept()
-    print("\n" + "=" * 80)
-    print("🎤 SPEECHMATICS SESSION START")
-    print("=" * 80)
 
-    if not SPEECHMATICS_API_KEY:
-        await ws.send_json({"type": "error", "message": "SPEECHMATICS_API_KEY not configured"})
-        await ws.close()
-        return
+    final_text = ""
+    current_partial = ""
+    prev_full = ""
+    confirmed_text = ""
+    confirmed_word_count = 0
+    prev_remaining = ""
+    partial_count = 0
+    PARTIAL_INTERVAL = 2
+    CONFIRM_PUNCT_COUNT = 1  # number of punctuation+text matches needed to confirm
+    closed = False
 
-    speechmatics_client = None
+    async def on_confirmed_translation(confirmed_korean):
+        if not closed:
+            await ws.send_json({"type": "combined", "full": confirmed_korean})
 
-    # --- Translation pipeline ---
-    async def on_combined(full_text, seq):
-        await ws.send_json({
-            "type": "combined",
-            "seq": seq,
-            "full": full_text,
-        })
+    async def on_partial_translation(partial_korean):
+        if not closed:
+            await ws.send_json({"type": "translation", "text": partial_korean})
 
-    combiner = Combiner(on_combined=on_combined)
+    tone_detector = ToneDetector()
+    translator = Translator(on_confirmed=on_confirmed_translation, on_partial=on_partial_translation, tone_detector=tone_detector)
 
-    async def on_translation(english_source, translated_text, seq):
-        await ws.send_json({"type": "translation", "seq": seq, "text": translated_text})
-        combiner.feed_translation(english_source, translated_text)
+    def get_full_text():
+        if not final_text:
+            return current_partial.strip()
+        if not current_partial:
+            return final_text.strip()
+        f = final_text.rstrip()
+        p = current_partial.strip()
+        best = 0
+        for length in range(1, min(len(f), len(p)) + 1):
+            if f.endswith(p[:length]):
+                best = length
+        return (f + p[best:]).strip() if best > 0 else (f + " " + p).strip()
 
-    translator = Translator(on_translation=on_translation, partial_interval=6)
+    def update_remaining(full):
+        nonlocal confirmed_text, confirmed_word_count, prev_remaining, partial_count
 
-    class SessionState:
-        def __init__(self):
-            self.first_audio_time = None
-            self.first_partial_time = None
-            self.first_final_time = None
-            self.final_text = ""
-            self.current_partial = ""
-            self.prev_full_text = ""
-            self.partial_count = 0
+        tone_detector.feed_text(full)
+        words = full.split()
+        remaining_text = " ".join(words[confirmed_word_count:])
 
-        def get_full_text(self) -> str:
-            if not self.final_text:
-                return self.current_partial.strip()
-            if not self.current_partial:
-                return self.final_text.strip()
+        # Check for confirmed sentence: need CONFIRM_PUNCT_COUNT punctuation+text matches
+        matches = list(re.finditer(r'[.?!]\s+\w', remaining_text))
+        if len(matches) >= CONFIRM_PUNCT_COUNT:
+            cut_match = matches[-CONFIRM_PUNCT_COUNT]
+            cut = cut_match.start() + 1
+            new_confirmed = remaining_text[:cut].strip()
 
-            final = self.final_text.rstrip()
-            partial = self.current_partial.strip()
+            if new_confirmed:
+                confirmed_text = (confirmed_text + " " + new_confirmed).strip() if confirmed_text else new_confirmed
+                confirmed_word_count += len(new_confirmed.split())
+                remaining_text = " ".join(words[confirmed_word_count:])
+                print(f"✅ confirmed: \"{new_confirmed}\"")
+                loop = asyncio.get_event_loop()
+                loop.create_task(translator.translate_confirmed(new_confirmed))
+                partial_count = 0
 
-            best_overlap = 0
-            max_check = min(len(final), len(partial))
-            for length in range(1, max_check + 1):
-                if final.endswith(partial[:length]):
-                    best_overlap = length
+        # Fire partial translation every N updates
+        partial_count += 1
+        if partial_count % PARTIAL_INTERVAL == 0 and remaining_text:
+            loop = asyncio.get_event_loop()
+            loop.create_task(translator.translate_partial(remaining_text))
 
-            if best_overlap > 0:
-                return (final + partial[best_overlap:]).strip()
-            else:
-                return (final + " " + partial).strip()
+        if remaining_text != prev_remaining:
+            prev_remaining = remaining_text
 
-    state = SessionState()
+    client = AsyncClient(api_key=SPEECHMATICS_API_KEY)
+    await client.__aenter__()
 
-    audio_format = AudioFormat(
-        encoding=AudioEncoding.PCM_S16LE,
-        chunk_size=4096,
-        sample_rate=16000,
-    )
+    @client.on(ServerMessageType.ADD_TRANSCRIPT)
+    def on_final(msg):
+        nonlocal final_text, prev_full
+        transcript = TranscriptResult.from_message(msg).metadata.transcript
+        if transcript:
+            final_text = final_text + transcript if final_text else transcript
+            full = get_full_text()
+            if full != prev_full:
+                prev_full = full
+                update_remaining(full)
 
-    transcription_config = TranscriptionConfig(
-        language="en",
-        enable_partials=True,
-        operating_point=OperatingPoint.ENHANCED,
-        diarization="speaker",
-        speaker_diarization_config={
-            "max_speakers": 10
-        }
-    )
+    @client.on(ServerMessageType.ADD_PARTIAL_TRANSCRIPT)
+    def on_partial(msg):
+        nonlocal current_partial, prev_full
+        current_partial = TranscriptResult.from_message(msg).metadata.transcript or ""
+        full = get_full_text()
+        if full and full != prev_full:
+            prev_full = full
+            update_remaining(full)
+            if not closed:
+                loop = asyncio.get_event_loop()
+                loop.create_task(ws.send_json({"type": "partial", "text": full}))
 
     try:
-        print("🔌 Connecting to Speechmatics...")
-        speechmatics_client = AsyncClient(api_key=SPEECHMATICS_API_KEY)
-        await speechmatics_client.__aenter__()
-
-        @speechmatics_client.on(ServerMessageType.ADD_TRANSCRIPT)
-        def handle_final_transcript(message):
-            current_time = time.time()
-
-            if state.first_final_time is None and state.first_audio_time:
-                state.first_final_time = current_time
-                latency = (state.first_final_time - state.first_audio_time) * 1000
-                print(f"\n⚡ FIRST FINAL LATENCY: {latency:.0f}ms")
-
-            result = TranscriptResult.from_message(message)
-            transcript = result.metadata.transcript
-
-            if transcript:
-                if state.final_text:
-                    state.final_text += transcript
-                else:
-                    state.final_text = transcript
-
-                full_text = state.get_full_text()
-                if full_text and full_text != state.prev_full_text:
-                    state.prev_full_text = full_text
-                    print(f"📗 ({len(full_text.split())}w): ...{full_text[-90:]}")
-
-        @speechmatics_client.on(ServerMessageType.ADD_PARTIAL_TRANSCRIPT)
-        def handle_partial_transcript(message):
-            current_time = time.time()
-
-            if state.first_partial_time is None and state.first_audio_time:
-                state.first_partial_time = current_time
-                latency = (state.first_partial_time - state.first_audio_time) * 1000
-                print(f"\n⚡ FIRST PARTIAL LATENCY: {latency:.0f}ms\n")
-
-            result = TranscriptResult.from_message(message)
-            transcript = result.metadata.transcript
-
-            state.current_partial = transcript or ""
-
-            full_text = state.get_full_text()
-            if not full_text or full_text == state.prev_full_text:
-                return
-            state.prev_full_text = full_text
-
-            print(f"📝 ({len(full_text.split())}w): ...{full_text[-90:]}")
-
-            loop = asyncio.get_event_loop()
-            loop.create_task(ws.send_json({"type": "partial", "text": full_text}))
-
-            translator.feed_partial(full_text)
-
-        print("🚀 Starting session...")
-        await speechmatics_client.start_session(
-            transcription_config=transcription_config,
-            audio_format=audio_format,
+        await client.start_session(
+            transcription_config=TranscriptionConfig(
+                language="en",
+                enable_partials=True,
+                operating_point=OperatingPoint.ENHANCED,
+            ),
+            audio_format=AudioFormat(encoding="pcm_s16le", chunk_size=4096, sample_rate=16000),
         )
-        print("✅ Session started successfully")
-        print("─" * 80)
-
         await ws.send_json({"type": "session_started", "data": {"status": "connected"}})
 
-        await forward_audio(ws, speechmatics_client, state)
-
-    except AuthenticationError as e:
-        print(f"\n❌ Authentication Error: {e}")
-        await ws.send_json({"type": "error", "message": f"Authentication error: {e}"})
-    except WebSocketDisconnect:
-        print("\n👋 Client disconnected")
-    except Exception as e:
-        print(f"\n❌ ERROR: {type(e).__name__}: {e}")
-    finally:
-        if speechmatics_client:
-            try:
-                await speechmatics_client.__aexit__(None, None, None)
-            except:
-                pass
-
-        if state.first_audio_time:
-            print("\n" + "─" * 80)
-            print("📊 SESSION SUMMARY:")
-            if state.first_partial_time:
-                print(f"   First Partial: {(state.first_partial_time - state.first_audio_time) * 1000:.0f}ms")
-            if state.first_final_time:
-                print(f"   First Final: {(state.first_final_time - state.first_audio_time) * 1000:.0f}ms")
-            print(f"   Final text length: {len(state.final_text.split())} words")
-            print("─" * 80)
-
-        print("=" * 80 + "\n")
-
-
-async def forward_audio(client_ws: WebSocket, speechmatics_client, state):
-    chunk_count = 0
-
-    try:
         while True:
-            message = await client_ws.receive()
-
+            message = await ws.receive()
             if "text" not in message:
                 continue
-
             data = json.loads(message["text"])
-            msg_type = data.get("type")
-
-            if msg_type == "audio_chunk":
-                chunk_count += 1
-
-                if state.first_audio_time is None:
-                    state.first_audio_time = time.time()
-                    print(f"🎵 First audio chunk received\n")
-
-                audio_base64 = data.get("audio_base_64", "")
-                audio_bytes = base64.b64decode(audio_base64)
-                await speechmatics_client.send_audio(audio_bytes)
-
-            elif msg_type == "end_stream":
-                print(f"\n🛑 Stream ended ({chunk_count} total chunks)")
+            if data.get("type") == "audio_chunk":
+                audio = base64.b64decode(data.get("audio_base_64", ""))
+                await client.send_audio(audio)
+            elif data.get("type") == "end_stream":
+                print("🛑 Stream ended")
+                print(f"   EN confirmed: {confirmed_text}")
+                print(f"   KR confirmed: {translator.translated_confirmed}")
+                print(f"   KR partial: {translator.translated_partial}")
                 break
 
     except WebSocketDisconnect:
-        print(f"\n👋 Client disconnected after {chunk_count} chunks")
+        print("👋 Disconnected")
     except Exception as e:
-        print(f"\n❌ ERROR in forward_audio: {type(e).__name__}: {e}")
+        print(f"❌ {type(e).__name__}: {e}")
+    finally:
+        closed = True
+        await client.__aexit__(None, None, None)

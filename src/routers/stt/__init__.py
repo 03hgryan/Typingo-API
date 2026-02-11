@@ -5,9 +5,7 @@ Speech-to-Text routers package.
 from fastapi import APIRouter
 # from .elevenlabsTwo import router as elevenlabs_router
 # from .elevenlabsTest import router as elevenlabs_router
-# from .speechmatics import router as elevenlabs_router
-# from .speechmaticsTest import router as elevenlabs_router
-from .speechmaticsTest import router as speechmatics_router
+from .speechmatics import router as speechmatics_router
 
 router = APIRouter()
 

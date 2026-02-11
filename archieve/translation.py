@@ -236,7 +236,7 @@ class TranslationWorker:
             print(f"🗑️  Removed {len(disappeared)} disappeared")
         
         if is_committed:
-            print(f"📨 Committed transcript received")
+            print("📨 Committed transcript received")
             self.pending_sentences.clear()
     
     async def _translate_remaining(self, text: str):
