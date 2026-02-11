@@ -1,0 +1,11 @@
+.venv/
+.git/
+.env
+__pycache__/
+*.pyc
+archieve/
+alembic/
+alembic.ini
+*.md
+.dockerignore
+Dockerfile

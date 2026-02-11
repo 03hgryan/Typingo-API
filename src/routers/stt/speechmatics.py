@@ -57,13 +57,12 @@ async def stream(ws: WebSocket):
             self.first_audio_time = None
             self.first_partial_time = None
             self.first_final_time = None
-            self.final_text = ""        # All finalized words concatenated
-            self.current_partial = ""   # Latest partial (unfinalised portion)
-            self.prev_full_text = ""    # For dedup
-            self.partial_count = 0      # Count partials for translator feeding
+            self.final_text = ""
+            self.current_partial = ""
+            self.prev_full_text = ""
+            self.partial_count = 0
 
         def get_full_text(self) -> str:
-            """Build full text from finals + partial, deduplicating overlap."""
             if not self.final_text:
                 return self.current_partial.strip()
             if not self.current_partial:
@@ -119,13 +118,11 @@ async def stream(ws: WebSocket):
             transcript = result.metadata.transcript
 
             if transcript:
-                # Accumulate finals
                 if state.final_text:
                     state.final_text += transcript
                 else:
                     state.final_text = transcript
 
-                # Build full text and print
                 full_text = state.get_full_text()
                 if full_text and full_text != state.prev_full_text:
                     state.prev_full_text = full_text
@@ -143,10 +140,8 @@ async def stream(ws: WebSocket):
             result = TranscriptResult.from_message(message)
             transcript = result.metadata.transcript
 
-            # Update current partial
             state.current_partial = transcript or ""
 
-            # Build full text
             full_text = state.get_full_text()
             if not full_text or full_text == state.prev_full_text:
                 return
@@ -154,11 +149,9 @@ async def stream(ws: WebSocket):
 
             print(f"📝 ({len(full_text.split())}w): ...{full_text[-90:]}")
 
-            # Send partial to client for display
             loop = asyncio.get_event_loop()
             loop.create_task(ws.send_json({"type": "partial", "text": full_text}))
 
-            # Feed to translator
             translator.feed_partial(full_text)
 
         print("🚀 Starting session...")

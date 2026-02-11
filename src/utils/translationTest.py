@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import asyncio
 from openai import AsyncOpenAI
@@ -9,7 +10,7 @@ oai = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 TARGET_LANG = "Korean"
 MAX_WORDS = 25
 
-BASE_SYSTEM_PROMPT = """You are a real-time subtitle translator. Translate the given English text to {lang}.
+SYSTEM_PROMPT = """You are a real-time subtitle translator. Translate the given English text to {lang}.
 
 {tone_instruction}
 
@@ -29,43 +30,53 @@ class Translator:
         self.partial_count = 0
         self.tone_detector = ToneDetector()
         self._last_tone = self.tone_detector.current_tone
+        self._last_fire_time = None
+        self._last_fire_words = 0
 
     def _get_prompt(self) -> str:
         tone = self.tone_detector.current_tone
         if tone != self._last_tone:
             self._last_tone = tone
-            print(f"🎭 Translator prompt updated → {tone}")
-        return BASE_SYSTEM_PROMPT.format(
+            print(f"🎭 Tone updated → {tone}")
+
+        return SYSTEM_PROMPT.format(
             lang=TARGET_LANG,
             tone_instruction=self.tone_detector.get_tone_instruction(),
         )
 
     def feed_partial(self, partial_text: str):
-        # Feed to tone detector (non-blocking)
         self.tone_detector.feed_text(partial_text)
-
         self.partial_count += 1
 
-        # First partial: translate immediately for fast initial display
-        # After that: every N partials
         if self.partial_count == 1:
-            pass  # Fall through to translate
+            pass
         elif self.partial_count % self.partial_interval != 0:
             return None
 
         words = partial_text.split()
-        text = " ".join(words[-MAX_WORDS:]) if len(words) > MAX_WORDS else partial_text
+        total_words = len(words)
+        text = " ".join(words[-MAX_WORDS:]) if total_words > MAX_WORDS else partial_text
 
         if not text.strip():
             return None
+
+        now = time.monotonic()
+        if self._last_fire_time is not None:
+            gap_ms = (now - self._last_fire_time) * 1000
+            word_delta = total_words - self._last_fire_words
+            print(f"⏱️  fire gap:{gap_ms:.0f}ms | +{word_delta}w | total:{total_words}w | partial#{self.partial_count}")
+        else:
+            print(f"⏱️  first fire | total:{total_words}w | partial#{self.partial_count}")
+        self._last_fire_time = now
+        self._last_fire_words = total_words
 
         self.seq += 1
         return asyncio.create_task(self._run(text.strip(), self.seq))
 
     async def _run(self, text: str, seq: int):
         try:
-            word_count = len(text.split())
             t_start = time.monotonic()
+            word_count = len(text.split())
 
             stream = await oai.chat.completions.create(
                 model="gpt-4o-mini",
@@ -97,11 +108,16 @@ class Translator:
                 return
 
             self.latest_seq = seq
+
             tone = self.tone_detector.current_tone
-            print(f"🌐 [{seq}] {word_count}w [{tone}] | ttft:{ttft:.0f}ms total:{total_ms:.0f}ms | {translated.strip()[:80]}")
+            print(f"🌐 [{seq}] {word_count}w [{tone}] | ttft:{ttft:.0f}ms total:{total_ms:.0f}ms")
+            print(f"    EN: {text[:80]}")
+            print(f"    KR: {translated.strip()[:80]}")
 
             if self.on_translation:
                 await self.on_translation(text, translated.strip(), seq)
 
         except Exception as e:
+            import traceback
             print(f"Translation error: {type(e).__name__}: {e}")
+            traceback.print_exc()
