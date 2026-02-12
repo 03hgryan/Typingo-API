@@ -1,7 +1,16 @@
 API for AST, ASR + translation
 
 Update Log:
+
 02 11
+
+Configurable source and target language:
+
+- Target language (translation output) is now configurable from the frontend via query param `target_lang`
+- Source language (ASR input) is configurable via query param `source_lang` for Speechmatics; ElevenLabs auto-detects
+- Translator accepts `target_lang` parameter
+- ToneDetector is now language-aware: Korean and Japanese get language-specific tone instructions, others get generic tone guidance
+- Renamed all Korean/English-specific variable names to language-neutral equivalents (`confirmed_korean` → `confirmed_translation`, `english_source` → `source_text`, etc.)
 
 Multi-provider STT support:
 

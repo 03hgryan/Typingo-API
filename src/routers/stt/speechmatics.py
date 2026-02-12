@@ -35,16 +35,18 @@ async def stream(ws: WebSocket):
     CONFIRM_PUNCT_COUNT = 1  # number of punctuation+text matches needed to confirm
     closed = False
 
-    async def on_confirmed_translation(confirmed_korean):
+    async def on_confirmed_translation(confirmed_translation):
         if not closed:
-            await ws.send_json({"type": "confirmed_translation", "text": confirmed_korean})
+            await ws.send_json({"type": "confirmed_translation", "text": confirmed_translation})
 
-    async def on_partial_translation(partial_korean):
+    async def on_partial_translation(partial_translation):
         if not closed:
-            await ws.send_json({"type": "partial_translation", "text": partial_korean})
+            await ws.send_json({"type": "partial_translation", "text": partial_translation})
 
-    tone_detector = ToneDetector()
-    translator = Translator(on_confirmed=on_confirmed_translation, on_partial=on_partial_translation, tone_detector=tone_detector)
+    target_lang = ws.query_params.get("target_lang", "Korean")
+    source_lang = ws.query_params.get("source_lang", "en")
+    tone_detector = ToneDetector(target_lang=target_lang)
+    translator = Translator(on_confirmed=on_confirmed_translation, on_partial=on_partial_translation, tone_detector=tone_detector, target_lang=target_lang)
 
     def get_full_text():
         if not final_text:
@@ -120,7 +122,7 @@ async def stream(ws: WebSocket):
     try:
         await client.start_session(
             transcription_config=TranscriptionConfig(
-                language="en",
+                language=source_lang,
                 enable_partials=True,
                 operating_point=OperatingPoint.ENHANCED,
             ),
@@ -138,9 +140,9 @@ async def stream(ws: WebSocket):
                 await client.send_audio(audio)
             elif data.get("type") == "end_stream":
                 print("🛑 Stream ended")
-                print(f"   EN confirmed: {confirmed_text}")
-                print(f"   KR confirmed: {translator.translated_confirmed}")
-                print(f"   KR partial: {translator.translated_partial}")
+                print(f"   Source confirmed: {confirmed_text}")
+                print(f"   Translated confirmed: {translator.translated_confirmed}")
+                print(f"   Translated partial: {translator.translated_partial}")
                 break
 
     except WebSocketDisconnect:

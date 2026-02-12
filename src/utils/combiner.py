@@ -95,7 +95,7 @@ class Combiner:
         self.latest_seq = -1
         self._lock = asyncio.Lock()
 
-    def feed_translation(self, english_source: str, translated_text: str):
+    def feed_translation(self, source_text: str, translated_text: str):
         if not translated_text.strip():
             return None
         self.seq += 1
