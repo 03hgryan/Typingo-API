@@ -12,6 +12,8 @@ import websockets
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from utils.tone import ToneDetector
 from utils.speaker_pipeline import SpeakerPipeline
+from auth.config import AUTH_ENABLED
+from auth.dependencies import require_ws_auth
 
 router = APIRouter()
 
@@ -23,6 +25,9 @@ CONNECTION_TIMEOUT = 10.0
 @router.websocket("")
 async def stream(ws: WebSocket):
     await ws.accept()
+    user = await require_ws_auth(ws)
+    if AUTH_ENABLED and user is None:
+        return
 
     if not ELEVENLABS_API_KEY:
         await ws.send_json({"type": "error", "message": "ELEVENLABS_API_KEY not configured"})

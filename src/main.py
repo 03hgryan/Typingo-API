@@ -8,13 +8,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI
 from src.routers import websocket
 from src.routers import stt
+from src.routers import auth as auth_router
+from src.auth.config import AUTH_ENABLED
 
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Preload LaBSE at startup
-    # load_model()
+    print(f"Auth {'ENABLED' if AUTH_ENABLED else 'DISABLED'}")
     yield
 
 
@@ -59,9 +60,16 @@ app.include_router(
 
 # Mount STT routers
 app.include_router(
-    stt.router, 
+    stt.router,
     prefix="/stt",
     tags=["stt"],
+)
+
+# Mount auth router
+app.include_router(
+    auth_router.router,
+    prefix="/auth",
+    tags=["auth"],
 )
 
 

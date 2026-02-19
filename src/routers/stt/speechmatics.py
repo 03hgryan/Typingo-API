@@ -14,6 +14,8 @@ from speechmatics.rt import (
 )
 from utils.tone import ToneDetector
 from utils.speaker_pipeline import SpeakerPipeline
+from auth.config import AUTH_ENABLED
+from auth.dependencies import require_ws_auth
 
 router = APIRouter()
 
@@ -23,6 +25,9 @@ SPEECHMATICS_API_KEY = os.getenv("SPEECHMATICS_API_KEY")
 @router.websocket("")
 async def stream(ws: WebSocket):
     await ws.accept()
+    user = await require_ws_auth(ws)
+    if AUTH_ENABLED and user is None:
+        return
 
     closed = False
     target_lang = ws.query_params.get("target_lang", "Korean")
