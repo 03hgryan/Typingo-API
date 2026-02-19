@@ -3,14 +3,27 @@ import json
 import time
 import asyncio
 import websockets
+from openai import AsyncOpenAI
 
-SYSTEM_PROMPT = """You are a real-time subtitle translator. Translate the given text to {lang}.
+_oai = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+SYSTEM_PROMPT = """You are a real-time subtitle translator for live audio. Translate to {lang}.
+
+The source text is auto-generated speech recognition, which may contain errors, mishearings, or awkward phrasing. Your job is to convey what the speaker *meant*, not to literally translate the raw transcript.
 
 Rules:
-- Translate naturally, not word-by-word
-- Match the speaker's energy and intent
-- Output ONLY the translation, nothing else
-- No quotes, no explanations, no labels"""
+- Translate the speaker's intent, not the literal text
+- If the transcript looks garbled or nonsensical, infer the likely meaning from context and translate that
+- Produce natural, fluent output as if a native {lang} speaker were explaining the same idea
+- Match the speaker's tone and energy
+- Output ONLY the translation, nothing else"""
+
+SUMMARY_PROMPT = """Summarize the following transcript in under 30 words. Focus on subject matter, key terms, entities, and the speaker's current point.
+
+Transcript:
+{transcript}
+
+Summary:"""
 
 
 class _ResponseTracker:
@@ -36,6 +49,9 @@ class RealtimeTranslator:
         self.translated_confirmed = ""
         self.translated_partial = ""
         self.context_pairs: list[tuple[str, str]] = []
+        self.confirmed_transcript = ""  # full accumulated transcript for summary
+        self.topic_summary = ""
+        self._summary_task: asyncio.Task | None = None
 
         self._ws = None
         self._connected = False
@@ -69,7 +85,7 @@ class RealtimeTranslator:
             "type": "session.update",
             "session": {
                 "modalities": ["text"],
-                "temperature": 0.3,
+                "temperature": 0.6,
                 "max_response_output_tokens": 200,
             }
         }))
@@ -86,12 +102,35 @@ class RealtimeTranslator:
         return prompt
 
     def _build_context(self) -> str:
-        if not self.context_pairs:
+        parts = []
+        if self.topic_summary:
+            parts.append(f"Topic: {self.topic_summary}")
+        if self.context_pairs:
+            source, translation = self.context_pairs[-1]
+            parts.append(f"Previous source: {source}\nPrevious translation: {translation}")
+        if not parts:
             return ""
-        lines = []
-        for source, translation in self.context_pairs:
-            lines.append(f"Source: {source}\nTranslation: {translation}")
-        return "Previous context:\n" + "\n\n".join(lines)
+        return "\n".join(parts)
+
+    def _update_summary_async(self):
+        if self._summary_task and not self._summary_task.done():
+            self._summary_task.cancel()
+        self._summary_task = asyncio.create_task(self._generate_summary())
+
+    async def _generate_summary(self):
+        try:
+            result = await _oai.responses.create(
+                model="gpt-4o-mini",
+                input=SUMMARY_PROMPT.format(transcript=self.confirmed_transcript),
+                temperature=0,
+                max_output_tokens=60,
+            )
+            new_summary = result.output_text.strip()
+            if new_summary:
+                self.topic_summary = new_summary
+                print(f"📝 Summary: {new_summary}")
+        except Exception as e:
+            print(f"Summary error: {type(e).__name__}: {e}")
 
     async def _read_loop(self):
         try:
@@ -185,7 +224,7 @@ class RealtimeTranslator:
     async def translate_confirmed(self, sentence: str, elapsed_ms: int = 0):
         word_count = len(sentence.split())
         translated = await self._send_translation(
-            sentence, f"CONFIRMED ({word_count}w, {len(self.context_pairs)}ctx)"
+            sentence, f"CONFIRMED ({word_count}w)"
         )
         if translated:
             self.translated_confirmed = (
@@ -196,13 +235,15 @@ class RealtimeTranslator:
             self.context_pairs.append((sentence, translated))
             if len(self.context_pairs) > 1:
                 self.context_pairs.pop(0)
+            self.confirmed_transcript = (self.confirmed_transcript + " " + sentence).strip() if self.confirmed_transcript else sentence
+            self._update_summary_async()
             if self.on_confirmed:
                 await self.on_confirmed(translated, elapsed_ms)
 
     async def translate_partial(self, text: str, elapsed_ms: int = 0):
         word_count = len(text.split())
         translated = await self._send_translation(
-            text, f"PARTIAL ({word_count}w, {len(self.context_pairs)}ctx)"
+            text, f"PARTIAL ({word_count}w)"
         )
         if translated:
             self.translated_partial = translated

@@ -2,6 +2,83 @@ API for AST, ASR + translation
 
 Update Log:
 
+02 17 ~ 02 19
+
+DeepL + GPT Realtime hybrid translation, expanded language support:
+
+- DeepL for confirmed (final) sentences, GPT Realtime for partial (preview) translations
+- DeepL `quality_optimized` produces superior translation quality (natural phrasing, context-aware, tone instructions)
+- GPT Realtime (`gpt-realtime-mini`) is ~40% faster but lower translation quality
+- User chooses "Quality" (DeepL, default) or "Speed" (Realtime) in frontend settings
+
+  Latency comparison (CS50 lecture, English → Korean, 5 rounds across 3 tests, 160 sentences total):
+
+  | Metric | Realtime | DeepL   | Diff   | %    |
+  | ------ | -------- | ------- | ------ | ---- |
+  | AVG    | ~370ms   | ~585ms  | +215ms | +58% |
+  | P50    | ~340ms   | ~550ms  | +210ms | +62% |
+  | P90    | ~540ms   | ~720ms  | +180ms | +33% |
+  | MIN    | ~235ms   | ~410ms  | +175ms | +74% |
+  | MAX    | ~1160ms  | ~1010ms | -150ms | -13% |
+
+  DeepL strengths:
+  - More natural, concise translations with context-aware phrasing
+  - Cross-sentence context (previous source/translation pairs, topic summaries)
+  - Custom instructions for ASR error recovery
+  - Formality + language-specific tone instructions (Korean 해요체/합니다체, Japanese です/ます体)
+  - Better worst-case latency (MAX ~1010ms vs ~1160ms)
+
+  GPT Realtime strengths:
+  - ~58% lower avg latency (370ms vs 585ms) via persistent WebSocket
+  - ~62% lower median latency (P50: 340ms vs 550ms)
+  - Cheaper per-request cost
+
+  Translation quality examples (CS50 lecture, English → Korean):
+
+  ```
+  #2 Source: This is-- DAVID J.
+     DeepL (  612ms): 이것은--
+        RT (  261ms): 이것은 바로 데이비드 J.
+
+  #3 Source: CS50, Harvard University's introduction to the intellectual enterprises of computer science and the arts of programming.
+     DeepL (  673ms): 하버드대학교에서 제공하는 컴퓨터 과학 입문 과정 CS50이에요.
+        RT (  373ms): CS50, 하버드 대학교에서 제공하는 컴퓨터 과학과 프로그래밍의 지적 탐구에 대한 입문 과정입니다.
+
+  #4 Source: My name is David Malan, and this is week 0.
+     DeepL ( 1235ms): 저는 데이비드 말란이고, 이번 주는 제로 주예요.
+        RT (  372ms): 제 이름은 데이비드 말란이고, 지금이 0주차입니다.
+
+  #5 Source: And by the end of today,
+     DeepL (  522ms): 오늘이 끝나갈 무렵에는
+        RT (  258ms): 그리고 오늘이 끝나면
+
+  #6 Source: you'll know not only what these light bulbs here spell, but so much more.
+     DeepL (  807ms): 여러분은 이 전구들이 어떤 의미를 가지고 있는지, 그리고 그 너머의 훨씬 더 많은 것들을 알게 될 거예요.
+        RT (  377ms): 오늘이 끝나면, 이 전구들이 무엇을 뜻하는지뿐만 아니라 훨씬 더 많은 것들을 알게 될 겁니다.
+
+  #7 Source: But why don't we start first with the elephant or the elephant in the room.
+     DeepL (  745ms): 하지만 먼저, 방 안의 코끼리라고 하는 표현부터 살펴볼까요?
+        RT (  412ms): 그럼 일단 시작해볼까요? 바로 '코끼리', 즉 '방 안의 코끼리'부터 말이죠.
+
+  #8 Source: That is artificial intelligence, which is seemingly everywhere over the past few years.
+     DeepL ( 1012ms): 여기서 '코끼리'는 바로 인공지능(AI)을 말해요. 최근 몇 년 동안 AI는 정말 어디에나 있는 것 같아요.
+        RT (  342ms): 그게 바로 인공지능인데, 지난 몇 년 동안 거의 어디에나 있다고 할 정도로 확산됐죠.
+
+  #9 Source: And it's been said that it's going to change programming.
+     DeepL (  626ms): 또 앞으로 프로그래밍 분야를 크게 바꿀 거라고 해요.
+        RT (  471ms): 그리고 그것이 프로그래밍을 바꿀 것이라고도 말해지고 있습니다.
+  ```
+
+  - DeepL: more natural Korean phrasing, concise, context-aware (#8 connects to #7's "elephant")
+  - RT: more literal/verbose, misses cross-sentence context
+
+- HTTP/2 (`httpx` with `http2=True`) for DeepL API calls to minimize connection overhead and latency
+- Expanded target languages from 7 to 108 (all DeepL-supported targets)
+- Expanded source languages to all 61 Speechmatics ASR languages
+- Centralized language definitions in `utils/languages.py`
+- Asterisk-only DeepL languages automatically use `quality_optimized` for all requests
+- Formality parameter only sent for languages that support it
+
 02 15 ~ 02 16
 
 OpenAI Realtime API for translation:

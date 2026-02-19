@@ -36,7 +36,9 @@ async def stream(ws: WebSocket):
     confirm_punct_count = 1 if aggressiveness <= 1 else 2
     use_splitter = aggressiveness <= 1
     partial_interval = int(ws.query_params.get("update_frequency", "2"))
-    use_realtime = True
+    translator_type = ws.query_params.get("translator", "realtime")
+    use_realtime = translator_type == "realtime"
+    use_deepl = translator_type == "deepl"
     tone_detector = ToneDetector(target_lang=target_lang)
 
     committed_text = ""
@@ -75,6 +77,7 @@ async def stream(ws: WebSocket):
         use_splitter=use_splitter,
         partial_interval=partial_interval,
         use_realtime=use_realtime,
+        use_deepl=use_deepl,
     )
 
     async def forward_audio(elevenlabs_ws):

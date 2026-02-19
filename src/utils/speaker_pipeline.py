@@ -3,6 +3,7 @@ import time
 import asyncio
 from utils.translation import Translator
 from utils.translation_realtime import RealtimeTranslator
+from utils.translation_deepl import DeepLTranslator
 from utils.tone import ToneDetector
 from utils.punctuation import SentenceSplitter
 
@@ -14,7 +15,7 @@ SILENCE_CONFIRM_SEC = 3.0
 class SpeakerPipeline:
     """Per-speaker sentence confirmation and translation pipeline."""
 
-    def __init__(self, speaker_id: str, on_confirmed, on_partial, on_confirmed_transcript, on_partial_transcript, target_lang: str, tone_detector: ToneDetector, stream_start: float = 0.0, confirm_punct_count: int = CONFIRM_PUNCT_COUNT, use_splitter: bool = True, partial_interval: int = PARTIAL_INTERVAL, use_realtime: bool = False):
+    def __init__(self, speaker_id: str, on_confirmed, on_partial, on_confirmed_transcript, on_partial_transcript, target_lang: str, tone_detector: ToneDetector, stream_start: float = 0.0, confirm_punct_count: int = CONFIRM_PUNCT_COUNT, use_splitter: bool = True, partial_interval: int = PARTIAL_INTERVAL, use_realtime: bool = False, use_deepl: bool = False):
         self.speaker_id = speaker_id
         self.confirmed_word_count = 0
         self.partial_count = 0
@@ -31,7 +32,12 @@ class SpeakerPipeline:
         self._awaiting_new_partial: bool = True  # True at start and after each confirmation
         self._partial_start_ts: float = 0.0      # Wall-clock time when current partial sequence began
         self._last_partial_len: int = 0          # Word count of last partial sent for translation
-        TranslatorClass = RealtimeTranslator if use_realtime else Translator
+        if use_deepl:
+            TranslatorClass = DeepLTranslator
+        elif use_realtime:
+            TranslatorClass = RealtimeTranslator
+        else:
+            TranslatorClass = Translator
         self.translator = TranslatorClass(
             on_confirmed=on_confirmed,
             on_partial=on_partial,
