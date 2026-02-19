@@ -4,6 +4,19 @@ Update Log:
 
 02 19
 
+Google OAuth authentication:
+
+- Google OAuth2 login flow via Chrome extension's `chrome.identity.launchWebAuthFlow()`
+- Backend mints JWT (PyJWT, HS256, 7-day expiry) after Google token exchange + userinfo fetch
+- User profiles upserted in Supabase `users` table (google_id, email, name, picture_url)
+- All WebSocket endpoints require `?token=<jwt>` when auth is enabled; REST endpoints use `Authorization: Bearer`
+- Dev mode: when `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`/`JWT_SECRET` not set, auth is skipped entirely (`AUTH_ENABLED=False`)
+- Extension popup shows user avatar + name when signed in, "Sign in" button when not; Start button gated behind auth
+- New backend files: `src/auth/` package (config, jwt_utils, supabase_client, dependencies), `src/routers/auth.py`
+- New endpoints: `GET /auth/google/login`, `GET /auth/google/callback`, `GET /auth/me`
+
+02 19
+
 Incremental streaming output for partial translations:
 
 - Stream each translated token to the client as it arrives from GPT, instead of waiting for the full translation to complete
